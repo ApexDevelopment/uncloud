@@ -9,10 +9,10 @@ import (
 
 	"github.com/docker/cli/cli/streams"
 	"github.com/psviderski/uncloud/internal/cli/config"
-	"github.com/psviderski/uncloud/internal/machine"
 	"github.com/psviderski/uncloud/internal/machine/api/pb"
 	"github.com/psviderski/uncloud/internal/machine/cluster"
 	"github.com/psviderski/uncloud/internal/machine/network"
+	"github.com/psviderski/uncloud/internal/machine/token"
 	"github.com/psviderski/uncloud/internal/sshexec"
 	"github.com/psviderski/uncloud/pkg/api"
 	"github.com/psviderski/uncloud/pkg/client"
@@ -399,7 +399,7 @@ func (cli *CLI) AddMachine(ctx context.Context, opts AddMachineOptions) (_ *clie
 	if err != nil {
 		return nil, nil, fmt.Errorf("get remote machine token: %w", err)
 	}
-	token, err := machine.ParseToken(tokenResp.Token)
+	tok, err := token.Parse(tokenResp.Token)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse remote machine token: %w", err)
 	}
@@ -410,8 +410,8 @@ func (cli *CLI) AddMachine(ctx context.Context, opts AddMachineOptions) (_ *clie
 	if len(opts.WireguardEndpoints) > 0 {
 		endpoints = opts.WireguardEndpoints
 	} else {
-		endpoints = make([]*pb.IPPort, len(token.Endpoints))
-		for i, addrPort := range token.Endpoints {
+		endpoints = make([]*pb.IPPort, len(tok.Endpoints))
+		for i, addrPort := range tok.Endpoints {
 			// If a custom WireGuard port is specified, override the port from the token endpoints
 			// since the token was generated before the machine knows its configured port.
 			if opts.WireguardPort != 0 && opts.WireguardPort != network.DefaultWireGuardPort {
@@ -440,15 +440,15 @@ func (cli *CLI) AddMachine(ctx context.Context, opts AddMachineOptions) (_ *clie
 		Name: machineName,
 		Network: &pb.NetworkConfig{
 			Endpoints: endpoints,
-			PublicKey: token.PublicKey,
+			PublicKey: tok.PublicKey,
 		},
 	}
 	if opts.PublicIP != nil {
 		if opts.PublicIP.IsValid() {
 			addReq.PublicIp = pb.NewIP(*opts.PublicIP)
-		} else if token.PublicIP.IsValid() {
+		} else if tok.PublicIP.IsValid() {
 			// Invalid or in other words zero IP means to use an automatically detected public IP from the token.
-			addReq.PublicIp = pb.NewIP(token.PublicIP)
+			addReq.PublicIp = pb.NewIP(tok.PublicIP)
 		}
 	}
 
