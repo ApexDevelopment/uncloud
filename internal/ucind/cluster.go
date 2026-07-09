@@ -15,7 +15,7 @@ import (
 	"github.com/docker/go-connections/nat"
 	"github.com/psviderski/uncloud/internal/machine/api/pb"
 	"github.com/psviderski/uncloud/internal/machine/cluster"
-	"github.com/psviderski/uncloud/internal/machine/token"
+	machinetoken "github.com/psviderski/uncloud/internal/machine/token"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -168,21 +168,21 @@ func (p *Provisioner) initCluster(ctx context.Context, machines []Machine) error
 		if err != nil {
 			return fmt.Errorf("get machine token: %w", err)
 		}
-		tok, err := token.Parse(tokenResp.Token)
+		token, err := machinetoken.ParseToken(tokenResp.Token)
 		if err != nil {
 			return fmt.Errorf("parse machine token: %w", err)
 		}
 
 		// Register the machine in the cluster using its public key and endpoints from the token.
-		endpoints := make([]*pb.IPPort, len(tok.Endpoints))
-		for i, addrPort := range tok.Endpoints {
+		endpoints := make([]*pb.IPPort, len(token.Endpoints))
+		for i, addrPort := range token.Endpoints {
 			endpoints[i] = pb.NewIPPort(addrPort)
 		}
 		addReq := &pb.AddMachineRequest{
 			Name: m.Name,
 			Network: &pb.NetworkConfig{
 				Endpoints: endpoints,
-				PublicKey: tok.PublicKey,
+				PublicKey: token.PublicKey,
 			},
 		}
 		addResp, err := initClient.AddMachine(ctx, addReq)
