@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -20,6 +21,14 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+const (
+	defaultSSHSOCKSHost = "127.0.0.1"
+	// defaultSSHSOCKSPort is the local port used for the Windows ssh -D SOCKS tunnel. It can be
+	// overridden with UNCLOUD_SSH_SOCKS_PORT if another process already uses the default.
+	defaultSSHSOCKSPort = 51022
+	sshSOCKSPortEnv     = "UNCLOUD_SSH_SOCKS_PORT"
+)
+
 // SSHCLIConnector establishes a connection to the machine API by executing SSH CLI
 // and running `uncloudd dial-stdio` on the remote machine.
 type SSHCLIConnector struct {
@@ -31,7 +40,7 @@ type SSHCLIConnector struct {
 	// fwdCheckErr caches the result of the TCP forwarding check.
 	fwdCheckErr error
 
-	// socksOnce lazily establishes the SOCKS tunnel used to multiplex DialContext connections when
+	// socksOnce establishes the SOCKS tunnel on first use to multiplex DialContext connections when
 	// ControlMaster is unavailable (see socksTunnelDialer).
 	socksOnce   sync.Once
 	socksDialer proxy.ContextDialer
@@ -230,24 +239,22 @@ func (c *SSHCLIConnector) DialContext(ctx context.Context, network, address stri
 	return conn, nil
 }
 
-// socksTunnelDialer lazily starts a single `ssh -D` SOCKS proxy to the destination and returns a dialer that
-// routes connections through it. The tunnel is started once per connector and reused by all subsequent dials,
+// socksTunnelDialer starts a single `ssh -D` SOCKS proxy on first use and returns a dialer that routes
+// connections through it. The tunnel is started once per connector and reused by all subsequent dials,
 // so any number of concurrent connections are multiplexed over a single SSH connection. The tunnel is torn
 // down by Close. It uses the system ssh client, so it honours ~/.ssh/config host aliases, agents and keys
 // exactly like the rest of the connector.
 func (c *SSHCLIConnector) socksTunnelDialer(ctx context.Context) (proxy.ContextDialer, error) {
 	c.socksOnce.Do(func() {
-		port, err := freeLocalPort()
+		socksAddr, socksPort, err := sshSOCKSAddr()
 		if err != nil {
-			c.socksErr = fmt.Errorf("reserve local port for SSH SOCKS tunnel: %w", err)
+			c.socksErr = err
 			return
 		}
-		socksAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 
-		// The tunnel must outlive the dial context that triggered it, so give it its own cancellable context
-		// that is cancelled by Close.
+		// The tunnel must outlive the dial context that triggered it, so Close cancels this background context.
 		tunnelCtx, cancel := context.WithCancel(context.Background())
-		args := append(c.sshOptions(false), "-N", "-D", socksAddr, c.config.Destination())
+		args := append(c.sshOptions(false), "-o", "ExitOnForwardFailure=yes", "-N", "-D", socksAddr, c.config.Destination())
 		cmd := exec.CommandContext(tunnelCtx, "ssh", args...)
 		var stderr strings.Builder
 		cmd.Stderr = &stderr
@@ -257,10 +264,27 @@ func (c *SSHCLIConnector) socksTunnelDialer(ctx context.Context) (proxy.ContextD
 			return
 		}
 
-		// Wait for the SOCKS proxy to start accepting connections (or for ssh to exit on error).
-		if err := waitForSOCKSReady(ctx, socksAddr); err != nil {
+		var sshErr error
+		sshDone := make(chan struct{})
+		go func() {
+			sshErr = cmd.Wait()
+			close(sshDone)
+		}()
+
+		readyCtx, readyCancel := context.WithTimeout(ctx, 10*time.Second)
+		err = waitForSOCKSReady(readyCtx, socksAddr, sshDone, &sshErr)
+		readyCancel()
+		if err != nil {
 			cancel()
+			<-sshDone
 			detail := strings.TrimSpace(stderr.String())
+			if isLocalForwardBindFailure(detail) {
+				c.socksErr = fmt.Errorf(
+					"local SSH SOCKS port %d is already in use; set %s to an available local port and retry",
+					socksPort, sshSOCKSPortEnv,
+				)
+				return
+			}
 			if detail != "" {
 				err = fmt.Errorf("%w: %s", err, detail)
 			}
@@ -288,20 +312,30 @@ func (c *SSHCLIConnector) socksTunnelDialer(ctx context.Context) (proxy.ContextD
 	return c.socksDialer, c.socksErr
 }
 
-// freeLocalPort reserves an available TCP port on the loopback interface by briefly listening and closing.
-func freeLocalPort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
+func sshSOCKSAddr() (string, int, error) {
+	port := defaultSSHSOCKSPort
+	if value := os.Getenv(sshSOCKSPortEnv); value != "" {
+		var err error
+		port, err = strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65535 {
+			return "", 0, fmt.Errorf("invalid %s %q: must be a TCP port from 1 to 65535", sshSOCKSPortEnv, value)
+		}
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
+
+	return net.JoinHostPort(defaultSSHSOCKSHost, strconv.Itoa(port)), port, nil
 }
 
-// waitForSOCKSReady polls addr until a TCP connection succeeds, the context is cancelled, or a 15s deadline
+func isLocalForwardBindFailure(detail string) bool {
+	detail = strings.ToLower(detail)
+	return strings.Contains(detail, "address already in use") ||
+		strings.Contains(detail, "cannot listen to port") ||
+		strings.Contains(detail, "could not request local forwarding")
+}
+
+// waitForSOCKSReady polls addr until a TCP connection succeeds, the context is cancelled, or a 10s deadline
 // is reached. It gives the ssh SOCKS proxy time to authenticate and bind its local port.
-func waitForSOCKSReady(ctx context.Context, addr string) error {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+func waitForSOCKSReady(ctx context.Context, addr string, sshDone <-chan struct{}, sshErr *error) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -313,6 +347,11 @@ func waitForSOCKSReady(ctx context.Context, addr string) error {
 			return nil
 		}
 		select {
+		case <-sshDone:
+			if *sshErr == nil {
+				return errors.New("ssh exited before SOCKS proxy became ready")
+			}
+			return fmt.Errorf("ssh exited before SOCKS proxy became ready: %w", *sshErr)
 		case <-ctx.Done():
 			return fmt.Errorf("SOCKS proxy did not become ready: %w", ctx.Err())
 		case <-ticker.C:

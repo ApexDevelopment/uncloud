@@ -1,7 +1,9 @@
 package connector
 
 import (
+	"net"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -116,6 +118,33 @@ func TestSSHCLIConnector_buildSSHArgs(t *testing.T) {
 			assert.Equal(t, tt.expected, got)
 		})
 	}
+}
+
+func TestSSHSOCKSAddr(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		t.Setenv(sshSOCKSPortEnv, "")
+
+		addr, port, err := sshSOCKSAddr()
+		assert.NoError(t, err)
+		assert.Equal(t, defaultSSHSOCKSPort, port)
+		assert.Equal(t, net.JoinHostPort(defaultSSHSOCKSHost, strconv.Itoa(defaultSSHSOCKSPort)), addr)
+	})
+
+	t.Run("env override", func(t *testing.T) {
+		t.Setenv(sshSOCKSPortEnv, "51180")
+
+		addr, port, err := sshSOCKSAddr()
+		assert.NoError(t, err)
+		assert.Equal(t, 51180, port)
+		assert.Equal(t, net.JoinHostPort(defaultSSHSOCKSHost, "51180"), addr)
+	})
+
+	t.Run("invalid env override", func(t *testing.T) {
+		t.Setenv(sshSOCKSPortEnv, "70000")
+
+		_, _, err := sshSOCKSAddr()
+		assert.ErrorContains(t, err, sshSOCKSPortEnv)
+	})
 }
 
 func TestControlSocketPath(t *testing.T) {
