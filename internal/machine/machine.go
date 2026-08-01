@@ -58,7 +58,6 @@ import (
 const (
 	DefaultMachineSockPath = "/run/uncloud/machine.sock"
 	DefaultSockGroup       = "uncloud"
-
 	// DefaultCaddyAdminSockPath is the default path to the Caddy admin socket for validating the generated Caddy
 	// reverse proxy configuration.
 	DefaultCaddyAdminSockPath = "/run/uncloud/caddy/admin.sock"

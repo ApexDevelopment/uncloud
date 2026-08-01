@@ -104,20 +104,14 @@ func (cli *CLI) ConnectCluster(ctx context.Context) (*client.Client, error) {
 	})
 }
 
-// connectOptions fills in the options configured on the CLI that the caller left unset.
-func (cli *CLI) connectOptions(opts ConnectOptions) ConnectOptions {
-	if opts.SSHSOCKSPort == 0 {
-		opts.SSHSOCKSPort = cli.sshSOCKSPort
-	}
-	return opts
-}
-
 // ConnectClusterWithOptions connects to a cluster with the given options.
 // If the CLI was initialised with a machine connection, the config is ignored and the connection is used instead.
 // If the CLI has an override context, it is used instead of the current default.
 // Options are useful when using the CLI as a library where you may want to disable visual feedback.
 func (cli *CLI) ConnectClusterWithOptions(ctx context.Context, opts ConnectOptions) (*client.Client, error) {
-	opts = cli.connectOptions(opts)
+	if opts.SSHSOCKSPort == 0 {
+		opts.SSHSOCKSPort = cli.sshSOCKSPort
+	}
 
 	if cli.conn != nil {
 		return ConnectCluster(ctx, *cli.conn, opts)
@@ -210,9 +204,7 @@ func (cli *CLI) initRemoteMachine(ctx context.Context, opts InitClusterOptions) 
 		return nil, err
 	}
 
-	machineClient, err := provisionOrConnectRemoteMachine(
-		ctx, opts.RemoteMachine, opts.SkipInstall, opts.Version, cli.sshSOCKSPort,
-	)
+	machineClient, err := provisionOrConnectRemoteMachine(ctx, opts.RemoteMachine, opts.SkipInstall, opts.Version)
 	if err != nil {
 		return nil, err
 	}
@@ -359,9 +351,7 @@ func (cli *CLI) AddMachine(ctx context.Context, opts AddMachineOptions) (_ *clie
 		}
 	}()
 
-	machineClient, err := provisionOrConnectRemoteMachine(
-		ctx, opts.RemoteMachine, opts.SkipInstall, opts.Version, cli.sshSOCKSPort,
-	)
+	machineClient, err := provisionOrConnectRemoteMachine(ctx, opts.RemoteMachine, opts.SkipInstall, opts.Version)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -548,7 +538,7 @@ func (cli *CLI) AddMachine(ctx context.Context, opts AddMachineOptions) (_ *clie
 // The remoteMachine.SSHKeyPath could be updated to the default SSH key path if it is not set and the SSH agent
 // authentication fails.
 func provisionOrConnectRemoteMachine(
-	ctx context.Context, remoteMachine *RemoteMachine, skipInstall bool, version string, sshSOCKSPort int,
+	ctx context.Context, remoteMachine *RemoteMachine, skipInstall bool, version string,
 ) (*client.Client, error) {
 	// Use Go's built-in SSH library.
 	if remoteMachine.UseSSHGo {
@@ -600,11 +590,10 @@ func provisionOrConnectRemoteMachine(
 
 	// Use the system 'ssh' command (default).
 	sshConfig := &connector.SSHConnectorConfig{
-		User:      remoteMachine.User,
-		Host:      remoteMachine.Host,
-		Port:      remoteMachine.Port,
-		KeyPath:   remoteMachine.KeyPath,
-		SOCKSPort: sshSOCKSPort,
+		User:    remoteMachine.User,
+		Host:    remoteMachine.Host,
+		Port:    remoteMachine.Port,
+		KeyPath: remoteMachine.KeyPath,
 	}
 	conn := connector.NewSSHCLIConnector(sshConfig)
 
