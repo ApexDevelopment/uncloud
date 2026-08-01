@@ -7,9 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/signal"
-	"runtime"
-	"syscall"
 
 	"github.com/moby/term"
 	"github.com/psviderski/uncloud/internal/machine/api/pb"
@@ -66,42 +63,6 @@ func setupTerminal(ctx context.Context, stream pb.Docker_ExecContainerClient) (f
 	}
 
 	return restoreFunc, nil
-}
-
-// handleTerminalResize sends initial window size and handles window resize signals for TTY sessions.
-func handleTerminalResize(ctx context.Context, inFd uintptr, stream pb.Docker_ExecContainerClient) error {
-	// Send initial window size
-	if size, err := term.GetWinsize(inFd); err == nil {
-		_ = sendResizeRequest(stream, size)
-	}
-
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.Signal(28))
-
-	go func() {
-		defer signal.Stop(sigCh)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-sigCh:
-				size, err := term.GetWinsize(inFd)
-				if err != nil {
-					slog.Debug("get window size", "error", err)
-					continue
-				}
-				if err = sendResizeRequest(stream, size); err != nil {
-					slog.Debug("send resize request", "error", err)
-				}
-			}
-		}
-	}()
-
-	return nil
 }
 
 // handleClientInputStream reads from stdin and sends data to the remote server.
