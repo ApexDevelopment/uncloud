@@ -33,15 +33,18 @@ type CLI struct {
 	Config          *config.Config
 	conn            *config.MachineConnection
 	contextOverride string
+	// sshSOCKSPort overrides the local port for the SSH SOCKS tunnel. Zero means the default port.
+	sshSOCKSPort int
 }
 
 // New creates a new CLI instance with the given config path or remote machine connection.
 // If the connection is provided, the config is ignored for all operations which is useful for interacting with
 // a cluster without creating a config.
 // If a non-empty context name is given, it will override the current default.
-func New(configPath string, conn *config.MachineConnection, contextName string) (*CLI, error) {
+// A non-zero sshSOCKSPort overrides the local port used for the SSH SOCKS tunnel.
+func New(configPath string, conn *config.MachineConnection, contextName string, sshSOCKSPort int) (*CLI, error) {
 	if conn != nil {
-		return &CLI{conn: conn}, nil
+		return &CLI{conn: conn, sshSOCKSPort: sshSOCKSPort}, nil
 	}
 
 	cfg, err := config.NewFromFile(configPath)
@@ -52,6 +55,7 @@ func New(configPath string, conn *config.MachineConnection, contextName string) 
 	return &CLI{
 		Config:          cfg,
 		contextOverride: contextName,
+		sshSOCKSPort:    sshSOCKSPort,
 	}, nil
 }
 
@@ -100,11 +104,21 @@ func (cli *CLI) ConnectCluster(ctx context.Context) (*client.Client, error) {
 	})
 }
 
+// connectOptions fills in the options configured on the CLI that the caller left unset.
+func (cli *CLI) connectOptions(opts ConnectOptions) ConnectOptions {
+	if opts.SSHSOCKSPort == 0 {
+		opts.SSHSOCKSPort = cli.sshSOCKSPort
+	}
+	return opts
+}
+
 // ConnectClusterWithOptions connects to a cluster with the given options.
 // If the CLI was initialised with a machine connection, the config is ignored and the connection is used instead.
 // If the CLI has an override context, it is used instead of the current default.
 // Options are useful when using the CLI as a library where you may want to disable visual feedback.
 func (cli *CLI) ConnectClusterWithOptions(ctx context.Context, opts ConnectOptions) (*client.Client, error) {
+	opts = cli.connectOptions(opts)
+
 	if cli.conn != nil {
 		return ConnectCluster(ctx, *cli.conn, opts)
 	}
@@ -196,7 +210,9 @@ func (cli *CLI) initRemoteMachine(ctx context.Context, opts InitClusterOptions) 
 		return nil, err
 	}
 
-	machineClient, err := provisionOrConnectRemoteMachine(ctx, opts.RemoteMachine, opts.SkipInstall, opts.Version)
+	machineClient, err := provisionOrConnectRemoteMachine(
+		ctx, opts.RemoteMachine, opts.SkipInstall, opts.Version, cli.sshSOCKSPort,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +359,9 @@ func (cli *CLI) AddMachine(ctx context.Context, opts AddMachineOptions) (_ *clie
 		}
 	}()
 
-	machineClient, err := provisionOrConnectRemoteMachine(ctx, opts.RemoteMachine, opts.SkipInstall, opts.Version)
+	machineClient, err := provisionOrConnectRemoteMachine(
+		ctx, opts.RemoteMachine, opts.SkipInstall, opts.Version, cli.sshSOCKSPort,
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -530,7 +548,7 @@ func (cli *CLI) AddMachine(ctx context.Context, opts AddMachineOptions) (_ *clie
 // The remoteMachine.SSHKeyPath could be updated to the default SSH key path if it is not set and the SSH agent
 // authentication fails.
 func provisionOrConnectRemoteMachine(
-	ctx context.Context, remoteMachine *RemoteMachine, skipInstall bool, version string,
+	ctx context.Context, remoteMachine *RemoteMachine, skipInstall bool, version string, sshSOCKSPort int,
 ) (*client.Client, error) {
 	// Use Go's built-in SSH library.
 	if remoteMachine.UseSSHGo {
@@ -582,10 +600,11 @@ func provisionOrConnectRemoteMachine(
 
 	// Use the system 'ssh' command (default).
 	sshConfig := &connector.SSHConnectorConfig{
-		User:    remoteMachine.User,
-		Host:    remoteMachine.Host,
-		Port:    remoteMachine.Port,
-		KeyPath: remoteMachine.KeyPath,
+		User:      remoteMachine.User,
+		Host:      remoteMachine.Host,
+		Port:      remoteMachine.Port,
+		KeyPath:   remoteMachine.KeyPath,
+		SOCKSPort: sshSOCKSPort,
 	}
 	conn := connector.NewSSHCLIConnector(sshConfig)
 

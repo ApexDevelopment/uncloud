@@ -27,9 +27,10 @@ import (
 )
 
 type globalOptions struct {
-	configPath string
-	connect    string
-	context    string
+	configPath   string
+	connect      string
+	context      string
+	sshSOCKSPort int
 }
 
 func main() {
@@ -45,6 +46,7 @@ func main() {
 			cli.BindEnvToFlag(cmd, "connect", "UNCLOUD_CONNECT")
 			cli.BindEnvToFlag(cmd, "context", "UNCLOUD_CONTEXT")
 			cli.BindEnvToFlag(cmd, "uncloud-config", "UNCLOUD_CONFIG")
+			cli.BindEnvToFlag(cmd, "ssh-socks-port", "UNCLOUD_SSH_SOCKS_PORT")
 
 			var conn *config.MachineConnection
 			if opts.connect != "" {
@@ -88,7 +90,7 @@ func main() {
 				}
 			}
 
-			uncli, err := cli.New(configPath, conn, opts.context)
+			uncli, err := cli.New(configPath, conn, opts.context, opts.sshSOCKSPort)
 			if err != nil {
 				return fmt.Errorf("initialise CLI: %w", err)
 			}
@@ -105,6 +107,9 @@ func main() {
 	_ = cmd.MarkPersistentFlagFilename("uncloud-config", "yaml", "yml")
 	cmd.PersistentFlags().StringVarP(&opts.context, "context", "c", "",
 		"Name of the cluster context to use (default is the current context). [$UNCLOUD_CONTEXT]")
+	cmd.PersistentFlags().IntVar(&opts.sshSOCKSPort, "ssh-socks-port", 0,
+		"Local port for the SSH SOCKS tunnel that multiplexes connections when SSH ControlMaster is\n"+
+			"unavailable, such as on Windows (default 51022). [$UNCLOUD_SSH_SOCKS_PORT]")
 
 	// Set custom help function to show links to docs and Discord only for the root 'uc' command.
 	defaultHelpFunc := cmd.HelpFunc()

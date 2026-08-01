@@ -1,14 +1,13 @@
 package connector
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,10 +22,11 @@ import (
 
 const (
 	defaultSSHSOCKSHost = "127.0.0.1"
-	// defaultSSHSOCKSPort is the local port used for the Windows ssh -D SOCKS tunnel. It can be
-	// overridden with UNCLOUD_SSH_SOCKS_PORT if another process already uses the default.
+	// defaultSSHSOCKSPort is the local port used for the ssh -D SOCKS tunnel. Override it with
+	// SSHConnectorConfig.SOCKSPort if another process already uses the default.
 	defaultSSHSOCKSPort = 51022
-	sshSOCKSPortEnv     = "UNCLOUD_SSH_SOCKS_PORT"
+	// socksReadyTimeout bounds how long to wait for ssh to authenticate and bind the local SOCKS port.
+	socksReadyTimeout = 10 * time.Second
 )
 
 // SSHCLIConnector establishes a connection to the machine API by executing SSH CLI
@@ -53,47 +53,6 @@ func NewSSHCLIConnector(cfg *SSHConnectorConfig) *SSHCLIConnector {
 		config:          *cfg,
 		controlSockPath: controlSocketPath(),
 	}
-}
-
-// controlSocketPath returns a unique control socket path for the SSH connection.
-// Returns an empty string if unable to find or create a suitable path.
-func controlSocketPath() string {
-	// Windows OpenSSH does not support connection multiplexing (ControlMaster/ControlPath): the control
-	// socket is a Unix domain socket and ssh fails with "getsockname failed: Not a socket". Return an
-	// empty path to disable multiplexing so each connection is established independently.
-	if runtime.GOOS == "windows" {
-		return ""
-	}
-
-	// %C is expanded by `ssh` to a hash of user, local and remote hostnames, port, and the contents
-	// of the ProxyJump option. This ensures that shared connections are uniquely identified.
-	sockName := fmt.Sprintf("uc_control_%%C.sock")
-
-	// Prefer XDG_RUNTIME_DIR if set and the directory exists, fall back to ~/.ssh if it exists.
-	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
-		// On WSL2 without systemd, XDG_RUNTIME_DIR may be set to /run/user/$UID that doesn't actually exist,
-		// so existence must be verified before use: https://github.com/psviderski/uncloud/issues/319.
-		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
-			return filepath.Join(dir, sockName)
-		}
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		sshDir := filepath.Join(home, ".ssh")
-		if fi, sErr := os.Stat(sshDir); sErr == nil && fi.IsDir() {
-			return filepath.Join(sshDir, sockName)
-		}
-	}
-
-	// Last resort: create a subdirectory in temp with restricted permissions.
-	tmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("uncloud-%d", os.Getuid()))
-	path := filepath.Join(tmpDir, sockName)
-	if len(path)-2+40 < 104 { // 40 chars for %C hash, 104 is typical UNIX socket path limit
-		if err := os.MkdirAll(tmpDir, 0o700); err == nil {
-			return path
-		}
-	}
-
-	return ""
 }
 
 func (c *SSHCLIConnector) Connect(ctx context.Context) (*grpc.ClientConn, error) {
@@ -138,13 +97,6 @@ func (c *SSHCLIConnector) Connect(ctx context.Context) (*grpc.ClientConn, error)
 // include control socket settings for connection reuse if the path is configured and useControlMaster is true.
 // The remote command is not included and should be appended by the caller.
 func (c *SSHCLIConnector) buildSSHArgs(useControlMaster bool) []string {
-	return append(c.sshOptions(useControlMaster), c.config.Destination())
-}
-
-// sshOptions returns the SSH command options (without the destination or any remote command). Callers that
-// need to insert flags such as -D or -W before the destination compose them as
-// append(sshOptions(...), flags..., Destination()).
-func (c *SSHCLIConnector) sshOptions(useControlMaster bool) []string {
 	var args []string
 
 	// Add control socket options for connection reuse if available.
@@ -180,6 +132,10 @@ func (c *SSHCLIConnector) sshOptions(useControlMaster bool) []string {
 	if c.config.KeyPath != "" {
 		args = append(args, "-i", c.config.KeyPath)
 	}
+
+	// Add [user@]host destination. Options may still follow it: ssh resumes option parsing after the
+	// destination, which is how callers append flags such as -W or -D.
+	args = append(args, c.config.Destination())
 
 	return args
 }
@@ -246,7 +202,7 @@ func (c *SSHCLIConnector) DialContext(ctx context.Context, network, address stri
 // exactly like the rest of the connector.
 func (c *SSHCLIConnector) socksTunnelDialer(ctx context.Context) (proxy.ContextDialer, error) {
 	c.socksOnce.Do(func() {
-		socksAddr, socksPort, err := sshSOCKSAddr()
+		socksAddr, err := c.socksAddr()
 		if err != nil {
 			c.socksErr = err
 			return
@@ -254,11 +210,11 @@ func (c *SSHCLIConnector) socksTunnelDialer(ctx context.Context) (proxy.ContextD
 
 		// The tunnel must outlive the dial context that triggered it, so Close cancels this background context.
 		tunnelCtx, cancel := context.WithCancel(context.Background())
-		args := append(c.sshOptions(false), "-o", "ExitOnForwardFailure=yes", "-N", "-D", socksAddr, c.config.Destination())
+		args := append(c.buildSSHArgs(false), "-o", "ExitOnForwardFailure=yes", "-N", "-D", socksAddr)
 		cmd := exec.CommandContext(tunnelCtx, "ssh", args...)
-		var stderr strings.Builder
+		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
-		if err := cmd.Start(); err != nil {
+		if err = cmd.Start(); err != nil {
 			cancel()
 			c.socksErr = fmt.Errorf("start SSH SOCKS tunnel to '%s': %w", c.config.Destination(), err)
 			return
@@ -271,24 +227,17 @@ func (c *SSHCLIConnector) socksTunnelDialer(ctx context.Context) (proxy.ContextD
 			close(sshDone)
 		}()
 
-		readyCtx, readyCancel := context.WithTimeout(ctx, 10*time.Second)
-		err = waitForSOCKSReady(readyCtx, socksAddr, sshDone, &sshErr)
-		readyCancel()
-		if err != nil {
+		if err = waitForSOCKSReady(ctx, socksAddr, sshDone, &sshErr); err != nil {
 			cancel()
 			<-sshDone
-			detail := strings.TrimSpace(stderr.String())
-			if isLocalForwardBindFailure(detail) {
-				c.socksErr = fmt.Errorf(
-					"local SSH SOCKS port %d is already in use; set %s to an available local port and retry",
-					socksPort, sshSOCKSPortEnv,
-				)
-				return
-			}
-			if detail != "" {
+			if detail := strings.TrimSpace(stderr.String()); detail != "" {
 				err = fmt.Errorf("%w: %s", err, detail)
 			}
-			c.socksErr = fmt.Errorf("establish SSH SOCKS tunnel to '%s': %w", c.config.Destination(), err)
+			c.socksErr = fmt.Errorf(
+				"establish SSH SOCKS tunnel to '%s' on %s: %w. If that local port is unavailable, "+
+					"pick another one with --ssh-socks-port",
+				c.config.Destination(), socksAddr, err,
+			)
 			return
 		}
 
@@ -312,36 +261,31 @@ func (c *SSHCLIConnector) socksTunnelDialer(ctx context.Context) (proxy.ContextD
 	return c.socksDialer, c.socksErr
 }
 
-func sshSOCKSAddr() (string, int, error) {
-	port := defaultSSHSOCKSPort
-	if value := os.Getenv(sshSOCKSPortEnv); value != "" {
-		var err error
-		port, err = strconv.Atoi(value)
-		if err != nil || port < 1 || port > 65535 {
-			return "", 0, fmt.Errorf("invalid %s %q: must be a TCP port from 1 to 65535", sshSOCKSPortEnv, value)
-		}
+// socksAddr returns the local address the ssh SOCKS tunnel listens on.
+func (c *SSHCLIConnector) socksAddr() (string, error) {
+	port := c.config.SOCKSPort
+	if port == 0 {
+		port = defaultSSHSOCKSPort
+	}
+	if port < 1 || port > 65535 {
+		return "", fmt.Errorf("invalid SSH SOCKS port %d: must be a TCP port from 1 to 65535", port)
 	}
 
-	return net.JoinHostPort(defaultSSHSOCKSHost, strconv.Itoa(port)), port, nil
+	return net.JoinHostPort(defaultSSHSOCKSHost, strconv.Itoa(port)), nil
 }
 
-func isLocalForwardBindFailure(detail string) bool {
-	detail = strings.ToLower(detail)
-	return strings.Contains(detail, "address already in use") ||
-		strings.Contains(detail, "cannot listen to port") ||
-		strings.Contains(detail, "could not request local forwarding")
-}
-
-// waitForSOCKSReady polls addr until a TCP connection succeeds, the context is cancelled, or a 10s deadline
-// is reached. It gives the ssh SOCKS proxy time to authenticate and bind its local port.
+// waitForSOCKSReady polls addr until a TCP connection succeeds, ssh exits, the context is cancelled, or
+// socksReadyTimeout elapses. It gives the ssh SOCKS proxy time to authenticate and bind its local port.
 func waitForSOCKSReady(ctx context.Context, addr string, sshDone <-chan struct{}, sshErr *error) error {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, socksReadyTimeout)
 	defer cancel()
 
+	dialer := net.Dialer{Timeout: time.Second}
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+
 	for {
-		conn, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "tcp", addr)
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err == nil {
 			conn.Close()
 			return nil
@@ -349,9 +293,9 @@ func waitForSOCKSReady(ctx context.Context, addr string, sshDone <-chan struct{}
 		select {
 		case <-sshDone:
 			if *sshErr == nil {
-				return errors.New("ssh exited before SOCKS proxy became ready")
+				return errors.New("ssh exited before the SOCKS proxy became ready")
 			}
-			return fmt.Errorf("ssh exited before SOCKS proxy became ready: %w", *sshErr)
+			return fmt.Errorf("ssh exited before the SOCKS proxy became ready: %w", *sshErr)
 		case <-ctx.Done():
 			return fmt.Errorf("SOCKS proxy did not become ready: %w", ctx.Err())
 		case <-ticker.C:

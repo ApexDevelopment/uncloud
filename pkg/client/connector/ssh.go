@@ -23,6 +23,9 @@ type SSHConnectorConfig struct {
 	KeyPath string
 
 	SockPath string
+	// SOCKSPort is the local port for the ssh -D SOCKS tunnel used to multiplex connections when SSH
+	// ControlMaster multiplexing is unavailable, such as on Windows. Zero means the default port.
+	SOCKSPort int
 }
 
 // Destination returns the destination string that can be passed to ssh CLI in the format [user@]host.
